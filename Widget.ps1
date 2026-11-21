@@ -3358,6 +3358,13 @@ function Invoke-Preview {
     Update-OpacityBar
     $card.UpdateLayout()
 
+    # 预览背景：Refresh-Picker 会按调色盘状态覆盖，所以在渲染前最后再设一次
+    if ($env:WIDGET_PREVIEW_BG) {
+        $script:Config['background'] = $env:WIDGET_PREVIEW_BG
+        Apply-Background -Hex $env:WIDGET_PREVIEW_BG
+        $card.UpdateLayout()
+    }
+
     $scale = 2.0
     $bitmap = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(
         [int]($width * $scale), [int]($height * $scale),
