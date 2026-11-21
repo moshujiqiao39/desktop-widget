@@ -186,19 +186,63 @@
 3. 写一个 `Update-xxx`，在 `Update-Tick` 里调用（1 秒一次）。
 4. 要联网就 `Start-HttpRequest -Kind 'xxx' -Url '...'`，回来在 `Handle-HttpResult` 里加分支——请求是队列化的，不用自己碰线程。
 
+## 加自己的 AI 工具（适配器）
+
+`adapters/` 里一个文件就是一个数据源，主程序不认识任何具体工具。加一个只要写：
+
+```powershell
+# adapters\my-tool.ps1
+@{
+    Id       = 'my-tool'        # 唯一 id
+    Name     = 'My Tool'        # 面板显示名
+    ShortName = 'MT'            # 卡片摘要里的简称
+    Note     = '今日已用'        # 默认说明文字
+    Order    = 15               # 排序
+    Interval = 300              # 刷新间隔（秒）
+    Summary  = $true            # 是否出现在卡片摘要行
+    KeyName  = ''               # 需要用户填密钥时，写 config 里的字段名
+    Collect  = {
+        # 返回 @{ Ok = 成功?; Value = 主数值; Note = 说明; Data = 任意 }
+        return @{ Ok = $true; Value = '1.2k'; Note = '今日已用 token' }
+    }
+}
+```
+
+能用的辅助函数：`Get-WidgetSetting 'x' 默认值`、`Format-TokenCount`、`Get-CurrencySymbol`、
+`Get-WidgetRoot`、`Get-WidgetCacheDir`、`Write-Log`、`Start-BgRequest` / `Poll-BgRequest`（异步 HTTP，不会卡界面）。
+
+现有的四个可以直接抄：`claude`（读 JSONL）、`codex`（读 SQLite）、`dsh`（解 zstd 逐请求计价）、`deepseek-balance`（查余额，需要 key）。
+
+## 换皮肤（theme.json）
+
+```json
+{
+  "background": "#1B2130",
+  "opacity": 0.96,
+  "cornerRadius": 14,
+  "accent": "#4C8DFF"
+}
+```
+
+这是**默认**主题；设置页里改的颜色和透明度会写进 `config.json` 并优先覆盖它。想做一套皮肤就把这个文件换掉（文字颜色会根据背景亮度自动黑/白翻转，不用手配）。
+
+## 第一次运行
+
+没有 `config.json` 时会自动生成一份默认配置，并**直接弹出设置页**，顶部有一条提示：勾上你想看的模块，点右上角 `✕` 收起即可。天气和定位全自动（设备定位失败就用 IP 定位）。
+
 ## 文件说明
 
 ```
 启动小组件.vbs      静默启动
 创建任务栏快捷方式.bat  在桌面生成「桌面小组件」快捷方式（固定到任务栏用）
-Widget.ps1          全部逻辑（界面 + 定位 + 天气 + 监控）
-诊断.bat            命令行自检
-config.json         配置，自动维护
-tasks.json          待办数据
+Widget.ps1          主程序（界面 + 定位 + 天气 + 监控 + 适配器调度）
+adapters/           AI 用量适配器，一个文件接一个工具
+theme.json          默认主题（背景/圆角/强调色），改这个就是换皮肤
 tools/dsh-cost.js   DSH 花费计算脚本（Node，逐请求计费）
-cache/ai-usage.json  AI 用量的增量缓存
+诊断.bat            命令行自检
+config.json         你的配置，首次运行自动生成
+tasks.json          待办数据
 widget.ico          程序图标（快捷方式和托盘用）
-cache/              最近一次天气缓存（断网时先显示旧的）
+cache/              天气缓存、适配器临时文件
 logs/               运行日志
-截图         界面截图
 ```

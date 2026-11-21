@@ -1,0 +1,7 @@
+{
+  "background": "#1B2130",
+  "opacity": 0.96,
+  "cornerRadius": 14,
+  "accent": "#4C8DFF",
+  "note": "这是默认主题；设置页里改的颜色/透明度会写到 config.json 并覆盖这里。改这个文件可以做自己的皮肤。"
+}

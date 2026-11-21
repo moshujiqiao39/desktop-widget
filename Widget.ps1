@@ -133,7 +133,17 @@ function Get-DefaultConfig {
         priceMiss             = 2.0
         priceOut              = 8.0
         background            = '#1B2130'
+        cornerRadius          = 14
     }
+}
+
+# 主题里的默认值兜底：config.json 没写的项用 theme.json
+function Apply-ThemeDefaults {
+    if (-not $script:Theme) { Read-Theme }
+    if (-not $script:Config) { return }
+    if (-not $script:Config['background']) { $script:Config['background'] = $script:Theme.background }
+    if ($null -eq $script:Config['opacity']) { $script:Config['opacity'] = $script:Theme.opacity }
+    if ($null -eq $script:Config['cornerRadius']) { $script:Config['cornerRadius'] = $script:Theme.cornerRadius }
 }
 
 function Read-Config {
@@ -181,12 +191,9 @@ $script:Tasks = @()
 $script:TasksOpen = $false
 $script:EditingTaskId = ''
 $script:ReminderActive = $false
-$script:Ai = @{}
-$script:AiCache = @{ claudeFiles = @{} }
-$script:AiPath = Join-Path $script:CacheDir 'ai-usage.json'
-$script:DeepSeekTask = $null
-$script:NextAiAt = [datetime]::MinValue
-$script:NextDshAt = [datetime]::MinValue
+$script:AiAdapters = @()
+$script:AiState = @{}
+$script:BgRequests = @{}
 $script:UiOpen = $false
 $script:PreTasksPos = $null
 $script:LastCpu = 0
@@ -545,6 +552,10 @@ $script:Xaml = @'
       <StackPanel x:Name="SettingsPanel" Visibility="Collapsed" Margin="20,16,20,14">
         <TextBlock Text="设置" FontSize="14.5" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
 
+        <Border x:Name="FirstRunHint" Visibility="Collapsed" Background="#22FFC857" CornerRadius="8" Padding="10,8" Margin="0,10,0,0">
+          <TextBlock Text="第一次运行：勾上你想看的模块，然后点右上角 ✕ 收起即可。天气和定位会自动处理。" FontSize="9.5" Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
+        </Border>
+
         <TextBlock Text="显示内容" FontSize="9.5" Foreground="{DynamicResource TextMuted}" Margin="0,13,0,0"/>
 
         <Grid Margin="0,7,0,0">
@@ -792,7 +803,8 @@ function New-Widget {
         'TaskNewButton', 'TaskEditView', 'TaskSaveButton', 'TaskDeleteButton', 'TaskCancelButton',
         'EditorTitle', 'EditorDue', 'EditorRemind', 'EditorRemindAt', 'EditorError',
         'ReminderBanner', 'ReminderText', 'ReminderOk', 'SwTasks', 'SwAi',
-        'AiRow', 'AiSummary', 'AiPanel', 'AiList', 'AiKeyBox', 'AiKeySave', 'AiRefresh', 'AiKeyLabel') {
+        'AiRow', 'AiSummary', 'AiPanel', 'AiList', 'AiKeyBox', 'AiKeySave', 'AiRefresh', 'AiKeyLabel',
+        'FirstRunHint') {
         $script:UI[$name] = $window.FindName($name)
     }
 
@@ -822,10 +834,9 @@ function New-Widget {
     $script:UI['TaskCancelButton'].Add_Click({ Close-TaskEditor })
     $script:UI['ReminderOk'].Add_Click({ Dismiss-Reminder })
     $script:UI['AiRow'].Add_MouseLeftButtonUp({ Open-AiPanel })
-    $script:UI['AiKeySave'].Add_Click({ Save-DeepSeekKey })
+    $script:UI['AiKeySave'].Add_Click({ Save-AiKey })
     $script:UI['AiRefresh'].Add_Click({
-            Update-AiUsage -Force
-            Start-DeepSeekBalance
+            Update-AiAdapters -Force
             Render-AiList
         })
     $script:UI['ResetButton'].Add_MouseLeftButtonUp({ Reset-Settings })
@@ -1762,8 +1773,7 @@ function Update-Tick {
     Update-Stats
     if ($script:CompactMode) { Update-CompactPanel }
     Update-TasksUI
-    Update-AiUsage
-    Poll-DeepSeekBalance
+    Update-AiAdapters
     Check-Reminders
     Poll-Location
     Receive-HttpResponse
@@ -2491,203 +2501,51 @@ function Toggle-Visibility {
 }
 
 # ============================================================ AI 用量 =====
-function Get-AiState {
-    if (-not $script:Ai) { $script:Ai = @{} }
-    if (-not $script:Ai.Claude) { $script:Ai.Claude = @{ Ok = $false; Today = 0; Msg = '' } }
-    if (-not $script:Ai.Codex) { $script:Ai.Codex = @{ Ok = $false; Today = 0; Msg = '' } }
-    if (-not $script:Ai.DeepSeek) { $script:Ai.DeepSeek = @{ Ok = $false; Balance = $null; Currency = ''; Msg = '' } }
-    if (-not $script:Ai.Dsh) { $script:Ai.Dsh = @{ Ok = $false; Today = 0; In = 0; Out = 0; Cache = 0; Sessions = 0; Cost = 0; Peak = 0; OffPeak = 0; Requests = 0; Models = @(); Msg = '' } }
+# 适配器机制：adapters/*.ps1 每个文件返回一个 hashtable，声明 Id/Name/Order/Interval/Collect
+# 这样加一个新工具 = 往 adapters 里丢一个文件，不用改主程序
+
+function Get-WidgetRoot { return $script:Root }
+function Get-WidgetCacheDir { return $script:CacheDir }
+
+function Get-WidgetSetting {
+    param([string]$Name, $Default = $null)
+    if ($script:Config -and $script:Config.Contains($Name) -and $null -ne $script:Config[$Name]) {
+        return $script:Config[$Name]
+    }
+    return $Default
 }
 
-function Save-AiCache {
-    try {
-        $files = [ordered]@{}
-        foreach ($key in $script:AiCache.claudeFiles.Keys) {
-            $entry = $script:AiCache.claudeFiles[$key]
-            $files[[string]$key] = [ordered]@{
-                stamp = [string]$entry.stamp
-                date  = [string]$entry.date
-                today = [double]$entry.today
-            }
-        }
-        Write-JsonFile $script:AiPath ([ordered]@{ claudeFiles = $files; savedAt = (Get-Date).ToString('o') })
-    } catch { }
+# --- 主题：theme.json 提供默认背景/透明度/圆角，config.json 里的用户选择优先 ---
+function Read-Theme {
+    $path = Join-Path $script:Root 'theme.json'
+    $data = Read-JsonFile $path
+    if (-not $data) { $data = [pscustomobject]@{} }
+    $theme = @{
+        background   = [string]$data.background
+        opacity      = $null
+        cornerRadius = 14
+        accent       = [string]$data.accent
+    }
+    if ($null -ne $data.opacity) { $theme.opacity = [double]$data.opacity }
+    if ($null -ne $data.cornerRadius) { $theme.cornerRadius = [double]$data.cornerRadius }
+    if (-not $theme.background) { $theme.background = '#1B2130' }
+    $script:Theme = $theme
 }
 
-function Restore-AiCache {
-    $data = Read-JsonFile $script:AiPath
-    if (-not $data -or -not $data.claudeFiles) { return }
-    try {
-        foreach ($prop in $data.claudeFiles.PSObject.Properties) {
-            $script:AiCache.claudeFiles[$prop.Name] = @{
-                stamp = [string]$prop.Value.stamp
-                date  = [string]$prop.Value.date
-                today = [double]$prop.Value.today
-            }
-        }
-    } catch { }
-}
-
-function Get-ClaudeUsage {
-    Get-AiState
-    $root = Join-Path $env:USERPROFILE '.claude\projects'
-    if (-not (Test-Path -LiteralPath $root)) {
-        $script:Ai.Claude.Ok = $false
-        $script:Ai.Claude.Msg = '未检测到'
-        return
-    }
-
-    $today = (Get-Date).ToString('yyyy-MM-dd')
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.jsonl -ErrorAction SilentlyContinue
-    if (-not $files) {
-        $script:Ai.Claude.Ok = $false
-        $script:Ai.Claude.Msg = '没有会话记录'
-        return
-    }
-
-    $sum = 0.0
-    $changed = $false
-    foreach ($file in $files) {
-        $key = $file.FullName
-        $stamp = '{0}|{1}' -f $file.LastWriteTimeUtc.Ticks, $file.Length
-        $cached = $script:AiCache.claudeFiles[$key]
-        if ($cached -and $cached.stamp -eq $stamp) {
-            if ($cached.date -eq $today) { $sum += [double]$cached.today }
-            continue
-        }
-
-        $todaySum = 0.0
-        try {
-            $reader = [IO.File]::OpenText($key)
-            try {
-                while ($null -ne ($line = $reader.ReadLine())) {
-                    if ($line.IndexOf($today, [StringComparison]::Ordinal) -lt 0) { continue }
-                    foreach ($m in [regex]::Matches($line, '"(?:input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens)":(\d+)')) {
-                        $todaySum += [double]$m.Groups[1].Value
-                    }
-                }
-            } finally { $reader.Close() }
-        } catch { }
-
-        $script:AiCache.claudeFiles[$key] = @{ stamp = $stamp; date = $today; today = $todaySum }
-        $changed = $true
-        $sum += $todaySum
-    }
-    if ($changed) { Save-AiCache }
-
-    $script:Ai.Claude.Ok = $true
-    $script:Ai.Claude.Today = $sum
-    $script:Ai.Claude.Msg = ''
-}
-
-# DSH 把每个会话的累计用量写在 session_projcache 的明文 JSON 里，随会话实时更新
-# 逐请求精确计费：解压会话日志，按「每次请求的模型 + 时刻（高峰/空闲）」折算人民币
-function Get-DshUsage {
-    Get-AiState
-    $sessionsDir = Join-Path $env:USERPROFILE '.dsh\sessions'
-    if (-not (Test-Path -LiteralPath $sessionsDir)) {
-        $script:Ai.Dsh.Ok = $false
-        $script:Ai.Dsh.Msg = '未检测到'
-        return
-    }
-
-    $scriptPath = Join-Path $script:Root 'tools\dsh-cost.js'
-    $node = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $node) { $node = Get-Command 'C:\Users\' + $env:USERNAME + '\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe' -ErrorAction SilentlyContinue }
-    if (-not $node -or -not (Test-Path -LiteralPath $scriptPath)) {
-        $script:Ai.Dsh.Ok = $false
-        $script:Ai.Dsh.Msg = '需要 Node 才能算'
-        return
-    }
-
-    $today = (Get-Date).ToString('yyyy-MM-dd')
-    $prices = [ordered]@{ 'deepseek-flash' = [ordered]@{ hit = [double]$script:Config['priceHit']; miss = [double]$script:Config['priceMiss']; out = [double]$script:Config['priceOut'] } }
-    $pricesJson = ConvertTo-Json -InputObject $prices -Compress -Depth 4
-
-    try {
-        $raw = & $node.Source $scriptPath $sessionsDir $today $pricesJson 2>$null | Out-String
-        $data = $raw.Trim() | ConvertFrom-Json
-    } catch {
-        $data = $null
-    }
-
-    if (-not $data -or -not $data.ok) {
-        $script:Ai.Dsh.Ok = $false
-        $script:Ai.Dsh.Msg = '今天还没有会话'
-        return
-    }
-
-    $script:Ai.Dsh.Ok = $true
-    $script:Ai.Dsh.Cost = [double]$data.cost
-    $script:Ai.Dsh.Peak = [double]$data.peakCost
-    $script:Ai.Dsh.OffPeak = [double]$data.offPeakCost
-    $script:Ai.Dsh.Tokens = [double]$data.tokens
-    $script:Ai.Dsh.In = [double]$data.inTokens
-    $script:Ai.Dsh.Out = [double]$data.outTokens
-    $script:Ai.Dsh.Cache = [double]$data.cacheRead
-    $script:Ai.Dsh.Today = [double]$data.tokens
-    $script:Ai.Dsh.Requests = [int]$data.requests
-    $script:Ai.Dsh.Sessions = [int]$data.files
-    $script:Ai.Dsh.Models = @($data.models)
-    $script:Ai.Dsh.Msg = ''
-}
-function Get-CodexUsage {
-    Get-AiState
-    $db = Join-Path $env:USERPROFILE '.codex\state_5.sqlite'
-    if (-not (Test-Path -LiteralPath $db)) {
-        $script:Ai.Codex.Ok = $false
-        $script:Ai.Codex.Msg = '未检测到'
-        return
-    }
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $python) {
-        $script:Ai.Codex.Ok = $false
-        $script:Ai.Codex.Msg = '需要 Python 才能读'
-        return
-    }
-
-    $py = @'
-import sqlite3, os, datetime
-p = os.path.join(os.path.expanduser("~"), ".codex", "state_5.sqlite")
-try:
-    con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
-    start = int(datetime.datetime.combine(datetime.date.today(), datetime.time.min).timestamp())
-    row = con.execute(
-        "select coalesce(sum(tokens_used),0), coalesce(sum(case when updated_at >= ? then tokens_used else 0 end),0) from threads",
-        (start,)).fetchone()
-    print("%d %d" % (row[0], row[1]))
-    con.close()
-except Exception as e:
-    print("ERR")
-'@
-    # 多行脚本用 -c 传会被 Windows 的参数引号规则吃掉，写成临时文件再跑
-    $pyPath = Join-Path $script:CacheDir 'codex-usage.py'
-    try {
-        [IO.File]::WriteAllText($pyPath, $py, (New-Object Text.UTF8Encoding($false)))
-        $out = & $python.Source $pyPath 2>$null
-        $text = ($out | Out-String).Trim()
-        if ($text -match '^(\d+)\s+(\d+)$') {
-            $script:Ai.Codex.Ok = $true
-            $script:Ai.Codex.Total = [double]$Matches[1]
-            $script:Ai.Codex.Today = [double]$Matches[2]
-            $script:Ai.Codex.Msg = ''
-        } else {
-            $script:Ai.Codex.Ok = $false
-            $script:Ai.Codex.Msg = '读取失败'
-        }
-    } catch {
-        $script:Ai.Codex.Ok = $false
-        $script:Ai.Codex.Msg = '读取失败'
+function Apply-ThemeRadius {
+    if (-not $script:UI -or -not $script:UI['Card']) { return }
+    $card = $script:UI['Card']
+    if ($card -is [System.Windows.Controls.Border] -and $script:Theme) {
+        $card.CornerRadius = [System.Windows.CornerRadius]::new([double]$script:Theme.cornerRadius)
     }
 }
 
-function Get-CurrencySymbol {
-    param([string]$Currency)
-    switch ($Currency.ToUpperInvariant()) {
-        'CNY' { return [char]0x00A5 }   # ¥
-        'USD' { return '$' }
-        default { return '' }
-    }
+function Get-NodeRuntime {
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $bundled = Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
+    if (Test-Path -LiteralPath $bundled) { return $bundled }
+    return $null
 }
 
 function Format-TokenCount {
@@ -2697,96 +2555,132 @@ function Format-TokenCount {
     return ('{0:0}' -f $Value)
 }
 
-function Start-DeepSeekBalance {
-    Get-AiState
-    $key = [string]$script:Config['deepseekKey']
-    if ([string]::IsNullOrWhiteSpace($key)) {
-        $script:Ai.DeepSeek.Ok = $false
-        $script:Ai.DeepSeek.Msg = '未填 API key'
-        return
-    }
-    if ($script:DeepSeekTask) { return }
-    try {
-        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, 'https://api.deepseek.com/user/balance')
-        $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $key.Trim())
-        $script:DeepSeekTask = $script:Http.SendAsync($request)
-        $script:DeepSeekDeadline = (Get-Date).AddSeconds(12)
-    } catch {
-        $script:Ai.DeepSeek.Ok = $false
-        $script:Ai.DeepSeek.Msg = '请求失败'
+function Get-CurrencySymbol {
+    param([string]$Currency)
+    switch (($Currency + '').ToUpperInvariant()) {
+        'CNY' { return [char]0x00A5 }
+        'USD' { return '$' }
+        default { return '' }
     }
 }
 
-function Poll-DeepSeekBalance {
-    if (-not $script:DeepSeekTask) { return }
-    if (-not $script:DeepSeekTask.IsCompleted) {
-        if ((Get-Date) -gt $script:DeepSeekDeadline) {
-            $script:DeepSeekTask = $null
-            Get-AiState
-            $script:Ai.DeepSeek.Ok = $false
-            $script:Ai.DeepSeek.Msg = '请求超时'
+# --- 异步 HTTP：适配器可以发起请求，主循环轮询结果，不阻塞界面 ---
+function Start-BgRequest {
+    param([string]$Id, [string]$Url, [hashtable]$Headers = @{})
+    try {
+        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+        foreach ($k in $Headers.Keys) {
+            if ($k -eq 'Authorization') {
+                $request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::Parse([string]$Headers[$k])
+            } else {
+                $null = $request.Headers.TryAddWithoutValidation($k, [string]$Headers[$k])
+            }
         }
-        return
+        $script:BgRequests[$Id] = @{
+            Task     = $script:Http.SendAsync($request)
+            Deadline = (Get-Date).AddSeconds(12)
+        }
+    } catch {
+        $script:BgRequests[$Id] = @{ Error = $_.Exception.Message; Done = $true }
+    }
+}
+
+function Poll-BgRequest {
+    param([string]$Id)
+    $entry = $script:BgRequests[$Id]
+    if (-not $entry) { return @{ Running = $false; Done = $false; Failed = $false } }
+    if ($entry.Error) {
+        $script:BgRequests.Remove($Id)
+        return @{ Running = $false; Done = $false; Failed = $true; Error = [string]$entry.Error }
+    }
+    if (-not $entry.Task.IsCompleted) {
+        if ((Get-Date) -gt $entry.Deadline) {
+            $script:BgRequests.Remove($Id)
+            return @{ Running = $false; Done = $false; Failed = $true; Error = '请求超时' }
+        }
+        return @{ Running = $true; Done = $false; Failed = $false }
     }
 
-    $task = $script:DeepSeekTask
-    $script:DeepSeekTask = $null
-    Get-AiState
+    $script:BgRequests.Remove($Id)
     try {
-        $response = $task.Result
+        $response = $entry.Task.Result
         $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
-            $script:Ai.DeepSeek.Ok = $false
-            if ([int]$response.StatusCode -eq 401) { $script:Ai.DeepSeek.Msg = 'API key 无效' }
-            else { $script:Ai.DeepSeek.Msg = ('HTTP ' + [int]$response.StatusCode) }
-            return
+            $msg = 'HTTP ' + [int]$response.StatusCode
+            if ([int]$response.StatusCode -eq 401) { $msg = 'API key 无效' }
+            return @{ Running = $false; Done = $false; Failed = $true; Error = $msg }
         }
-        $json = $body | ConvertFrom-Json
-        if ($json.balance_infos -and $json.balance_infos.Count -gt 0) {
-            $info = $json.balance_infos[0]
-            $script:Ai.DeepSeek.Ok = $true
-            $script:Ai.DeepSeek.Balance = [double]$info.total_balance
-            $script:Ai.DeepSeek.Currency = [string]$info.currency
-            $script:Ai.DeepSeek.Msg = ''
-        } else {
-            $script:Ai.DeepSeek.Ok = $false
-            $script:Ai.DeepSeek.Msg = '没有余额信息'
-        }
+        return @{ Running = $false; Done = $true; Failed = $false; Json = ($body | ConvertFrom-Json) }
     } catch {
-        $script:Ai.DeepSeek.Ok = $false
-        $script:Ai.DeepSeek.Msg = '解析失败'
+        return @{ Running = $false; Done = $false; Failed = $true; Error = $_.Exception.Message }
     }
 }
 
-function Update-AiUsage {
-    param([switch]$Force)
-    $now = Get-Date
-    $dshDue = $Force -or $now -ge $script:NextDshAt
-    $slowDue = $Force -or $now -ge $script:NextAiAt
-    if (-not $dshDue -and -not $slowDue) { return }
+# --- 适配器加载与刷新 ---
+function Import-AiAdapters {
+    $script:AiAdapters = @()
+    $dir = Join-Path $script:Root 'adapters'
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    foreach ($file in (Get-ChildItem -LiteralPath $dir -File -Filter *.ps1 | Sort-Object Name)) {
+        try {
+            # 读文本再执行，避开执行策略对 .ps1 的拦截
+            $adapter = & ([scriptblock]::Create([IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8)))
+            if ($adapter -and $adapter.Id -and $adapter.Collect) {
+                if (-not $adapter.ContainsKey('Order')) { $adapter.Order = 100 }
+                if (-not $adapter.ContainsKey('Interval')) { $adapter.Interval = 300 }
+                if (-not $adapter.ContainsKey('Summary')) { $adapter.Summary = $true }
+                if (-not $adapter.ContainsKey('ShortName')) { $adapter.ShortName = $adapter.Name }
+                if (-not $adapter.ContainsKey('KeyName')) { $adapter.KeyName = '' }
+                $script:AiAdapters += [pscustomobject]$adapter
+                Write-Log ("载入适配器：{0}" -f $adapter.Id)
+            }
+        } catch {
+            Write-Log ("适配器载入失败 {0}：{1}" -f $file.Name, $_.Exception.Message)
+        }
+    }
+    $script:AiAdapters = @($script:AiAdapters | Sort-Object Order)
+    foreach ($a in $script:AiAdapters) {
+        if (-not $script:AiState.ContainsKey($a.Id)) {
+            $script:AiState[$a.Id] = @{ Ok = $false; Value = '…'; Note = ''; NextRun = [datetime]::MinValue }
+        }
+    }
+}
 
-    if ($dshDue) {
-        Get-DshUsage
-        $script:NextDshAt = $now.AddSeconds(30)
+function Update-AiAdapters {
+    param([switch]$Force)
+    if (-not $script:AiAdapters) { return }
+    $now = Get-Date
+    $changed = $false
+    foreach ($adapter in $script:AiAdapters) {
+        $state = $script:AiState[$adapter.Id]
+        if (-not $state) { continue }
+        if (-not $Force -and $now -lt $state.NextRun) { continue }
+        try {
+            $result = & $adapter.Collect
+        } catch {
+            $result = @{ Ok = $false; Value = '出错'; Note = $_.Exception.Message }
+        }
+        if ($result) {
+            $state.Ok = [bool]$result.Ok
+            $state.Value = [string]$result.Value
+            $state.Note = [string]$result.Note
+            $state.Data = $result.Data
+        }
+        $state.NextRun = $now.AddSeconds([int]$adapter.Interval)
+        $changed = $true
     }
-    if ($slowDue) {
-        Get-ClaudeUsage
-        Get-CodexUsage
-        $minutes = [int]$script:Config['aiRefreshMinutes']
-        if ($minutes -lt 1) { $minutes = 5 }
-        $script:NextAiAt = $now.AddMinutes($minutes)
-    }
-    if ($script:UI) { Update-AiUI }
+    if ($changed -and $script:UI) { Update-AiUI }
 }
 
 function Get-AiSummaryText {
-    Get-AiState
+    if (-not $script:AiAdapters) { return 'AI · 未载入适配器' }
     $parts = @()
-    if ($script:Ai.Claude.Ok) { $parts += ('Claude {0}' -f (Format-TokenCount $script:Ai.Claude.Today)) }
-    if ($script:Ai.Codex.Ok) { $parts += ('Codex {0}' -f (Format-TokenCount $script:Ai.Codex.Today)) }
-    if ($script:Ai.Dsh.Ok) { $parts += ('DSH {0}{1}' -f [char]0x00A5, ('{0:0.00}' -f $script:Ai.Dsh.Cost)) }
-    if ($script:Ai.DeepSeek.Ok) { $parts += ('余额 {0}{1}' -f (Get-CurrencySymbol $script:Ai.DeepSeek.Currency), ('{0:0.00}' -f $script:Ai.DeepSeek.Balance)) }
-    if ($parts.Count -eq 0) { return 'AI · 未检测到可读用量' }
+    foreach ($adapter in $script:AiAdapters) {
+        if (-not $adapter.Summary) { continue }
+        $state = $script:AiState[$adapter.Id]
+        if ($state -and $state.Ok) { $parts += ('{0} {1}' -f $adapter.ShortName, $state.Value) }
+    }
+    if ($parts.Count -eq 0) { return 'AI · 暂无数据' }
     return ('AI 今日 · ' + ($parts -join ' · '))
 }
 
@@ -2827,6 +2721,7 @@ function New-AiRow {
         $noteBlock.FontSize = 8.5
         $noteBlock.Margin = [System.Windows.Thickness]::new(0, 2, 0, 0)
         $noteBlock.Foreground = Get-ThemeBrush 'TextMuted'
+        $noteBlock.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
         $left.Children.Add($noteBlock) | Out-Null
     }
     $grid.Children.Add($left) | Out-Null
@@ -2846,48 +2741,45 @@ function New-AiRow {
 
 function Render-AiList {
     if (-not $script:UI) { return }
-    Get-AiState
     $list = $script:UI['AiList']
     $list.Children.Clear()
 
-    $claudeValue = $script:Ai.Claude.Msg
-    if ($script:Ai.Claude.Ok) { $claudeValue = (Format-TokenCount $script:Ai.Claude.Today) }
-    $list.Children.Add((New-AiRow -Name 'Claude Code' -Value $claudeValue -Note '今日已用 token（本地日志）' -Ok $script:Ai.Claude.Ok)) | Out-Null
+    if (-not $script:AiAdapters -or $script:AiAdapters.Count -eq 0) {
+        $hint = [System.Windows.Controls.TextBlock]::new()
+        $hint.Text = '没有找到适配器（adapters/ 目录为空）'
+        $hint.FontSize = 9.5
+        $hint.Foreground = Get-ThemeBrush 'TextMuted'
+        $list.Children.Add($hint) | Out-Null
+        return
+    }
 
-    $codexValue = $script:Ai.Codex.Msg
-    if ($script:Ai.Codex.Ok) { $codexValue = (Format-TokenCount $script:Ai.Codex.Today) }
-    
-
-    $dshValue = $script:Ai.Dsh.Msg
-    if ($script:Ai.Dsh.Ok) { $dshValue = ('{0}{1}' -f [char]0x00A5, ('{0:0.00}' -f $script:Ai.Dsh.Cost)) }
-    $dshNote = '今日已用（DSH 会话缓存）'
-    if ($script:Ai.Dsh.Ok) {
-        $modelNames = @($script:Ai.Dsh.Models | ForEach-Object { $_.model }) -join '+'
-        if (-not $modelNames) { $modelNames = 'deepseek-flash' }
-        if ($script:Ai.Dsh.OffPeak -gt 0) {
-            $dshNote = ('{0} 次 · {1} · 高峰 ¥{2:0.00} / 空闲 ¥{3:0.00}' -f $script:Ai.Dsh.Requests, $modelNames, $script:Ai.Dsh.Peak, $script:Ai.Dsh.OffPeak)
-        } else {
-            $dshNote = ('{0} 次 · {1} · 高峰时段' -f $script:Ai.Dsh.Requests, $modelNames)
+    foreach ($adapter in $script:AiAdapters) {
+        $state = $script:AiState[$adapter.Id]
+        $value = '…'
+        $note = $adapter.Note
+        $ok = $false
+        if ($state) {
+            $value = $state.Value
+            if ($state.Note) { $note = $state.Note }
+            $ok = [bool]$state.Ok
         }
+        $list.Children.Add((New-AiRow -Name $adapter.Name -Value $value -Note $note -Ok $ok)) | Out-Null
     }
-    $list.Children.Add((New-AiRow -Name 'DeepSeek Harness' -Value $dshValue -Note $dshNote -Ok $script:Ai.Dsh.Ok)) | Out-Null
 
-    $list.Children.Add((New-AiRow -Name 'Codex' -Value $codexValue -Note '今日已用 token（本地数据库）' -Ok $script:Ai.Codex.Ok)) | Out-Null
-
-    $dsValue = $script:Ai.DeepSeek.Msg
-    if (-not $dsValue) { $dsValue = '未配置' }
-    if ($script:Ai.DeepSeek.Ok) {
-        $dsValue = ('{0}{1}' -f (Get-CurrencySymbol $script:Ai.DeepSeek.Currency), ('{0:0.00}' -f $script:Ai.DeepSeek.Balance))
+    # key 输入框：只有声明了 KeyName 的适配器才显示
+    $keyAdapter = $script:AiAdapters | Where-Object { $_.KeyName } | Select-Object -First 1
+    $showKey = $null -ne $keyAdapter
+    if ($script:UI['AiKeyBox']) {
+        $script:UI['AiKeyBox'].Visibility = $(if ($showKey) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
+        $script:UI['AiKeySave'].Visibility = $(if ($showKey) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed })
+        $script:UI['AiKeyBox'].Text = ''
     }
-    $list.Children.Add((New-AiRow -Name 'DeepSeek' -Value $dsValue -Note '账户余额（需要 API key）' -Ok $script:Ai.DeepSeek.Ok)) | Out-Null
-
-    # 已保存的 key 不回填到输入框，只显示尾号，避免截图泄露
-    if ($script:UI['AiKeyLabel']) {
-        $savedKey = [string]$script:Config['deepseekKey']
-        if ($savedKey.Length -gt 10) {
-            $script:UI['AiKeyLabel'].Text = ('DeepSeek API key（已保存 …{0}，留空则沿用）' -f $savedKey.Substring($savedKey.Length - 4))
+    if ($showKey -and $script:UI['AiKeyLabel']) {
+        $saved = [string](Get-WidgetSetting $keyAdapter.KeyName '')
+        if ($saved.Length -gt 10) {
+            $script:UI['AiKeyLabel'].Text = ('{0}（已保存 …{1}，留空则沿用）' -f $keyAdapter.Hint, $saved.Substring($saved.Length - 4))
         } else {
-            $script:UI['AiKeyLabel'].Text = 'DeepSeek API key（只存本机 config.json，用来查账户余额）'
+            $script:UI['AiKeyLabel'].Text = ('{0}（只存本机 config.json，用来查账户余额）' -f $keyAdapter.Hint)
         }
     }
 }
@@ -2908,9 +2800,10 @@ function Open-AiPanel {
     }
 
     Render-AiList
+    Update-AiAdapters -Force
     $script:Window.UpdateLayout()
     Ensure-WindowOnScreen
-    $script:Window.Activate()
+    $null = $script:Window.Activate()
     Write-Log '打开 AI 用量'
 }
 
@@ -2935,23 +2828,21 @@ function Close-AiPanel {
     Ensure-WindowOnScreen
 }
 
-function Save-DeepSeekKey {
-    $key = ([string]$script:UI['AiKeyBox'].Text).Trim()
-    if (-not $key) { $key = [string]$script:Config['deepseekKey'] }
-    $script:Config['deepseekKey'] = $key
+function Save-AiKey {
+    $keyAdapter = $script:AiAdapters | Where-Object { $_.KeyName } | Select-Object -First 1
+    if (-not $keyAdapter) { return }
+    $typed = ([string]$script:UI['AiKeyBox'].Text).Trim()
+    if (-not $typed) { $typed = [string](Get-WidgetSetting $keyAdapter.KeyName '') }
+    $script:Config[$keyAdapter.KeyName] = $typed
     Save-Config
     $script:UI['AiKeyBox'].Text = ''
-    $script:Ai.DeepSeek.Ok = $false
-    $script:Ai.DeepSeek.Msg = '查询中'
+    # 让这个适配器下次立刻重查
+    $state = $script:AiState[$keyAdapter.Id]
+    if ($state) { $state.NextRun = [datetime]::MinValue }
+    $script:BgRequests.Remove($keyAdapter.Id)
+    Update-AiAdapters -Force
     Render-AiList
-    if ($key) {
-        Start-DeepSeekBalance
-    } else {
-        $script:Ai.DeepSeek.Msg = '未填 API key'
-        Render-AiList
-    }
-    Update-AiUI
-    Write-Log '更新 DeepSeek API key'
+    Write-Log ('更新适配器密钥：{0}' -f $keyAdapter.Id)
 }
 
 # ============================================================ 待办 =========
@@ -3430,20 +3321,12 @@ function Invoke-Preview {
         $script:UI['ReminderText'].Text = '18:00 交季度报告'
     }
     if ($env:WIDGET_PREVIEW_AI) {
-        Get-AiState
-        $script:Ai.Claude.Ok = $true
-        $script:Ai.Claude.Today = 12345
-        $script:Ai.Codex.Ok = $true
-        $script:Ai.Codex.Today = 8200
-        $script:Ai.Dsh.Ok = $true
-        $script:Ai.Dsh.Cost = 16.2
-        $script:Ai.Dsh.Peak = 16.2
-        $script:Ai.Dsh.OffPeak = 0
-        $script:Ai.Dsh.Requests = 650
-        $script:Ai.Dsh.Models = @([pscustomobject]@{ model = 'deepseek-flash' })
-        $script:Ai.DeepSeek.Ok = $true
-        $script:Ai.DeepSeek.Balance = 9.47
-        $script:Ai.DeepSeek.Currency = 'CNY'
+        Read-Theme
+    Import-AiAdapters
+        $script:AiState['claude'] = @{ Ok = $true; Value = '12.3k'; Note = '今日已用 · 3 个会话文件'; NextRun = (Get-Date).AddHours(1) }
+        $script:AiState['codex'] = @{ Ok = $true; Value = '8.2k'; Note = '今日已用 · 累计 1.6M'; NextRun = (Get-Date).AddHours(1) }
+        $script:AiState['dsh'] = @{ Ok = $true; Value = '¥16.20'; Note = '650 次 · deepseek-flash · 高峰时段'; NextRun = (Get-Date).AddHours(1) }
+        $script:AiState['deepseek-balance'] = @{ Ok = $true; Value = '¥9.47'; Note = '充值 9.47 / 赠送 0.00'; NextRun = (Get-Date).AddHours(1) }
         $script:UI['MainPanel'].Visibility = [System.Windows.Visibility]::Collapsed
         $script:UI['AiPanel'].Visibility = [System.Windows.Visibility]::Visible
         foreach ($n in 'MinimizeButton', 'PinButton', 'SettingsButton') { $script:UI[$n].Visibility = [System.Windows.Visibility]::Collapsed }
@@ -3562,9 +3445,16 @@ function Invoke-Run {
     Initialize-Counters
     Initialize-Tray
 
+    Read-Theme
+    Apply-ThemeDefaults
+    Apply-ThemeRadius
+    $firstRun = -not (Test-Path -LiteralPath (Join-Path $script:Root 'config.json'))
+    if ($firstRun) {
+        Save-Config
+        Write-Log '首次运行：已生成默认 config.json'
+    }
     $script:Tasks = Read-Tasks
-    Restore-AiCache
-    if ($script:Config['deepseekKey']) { $script:NextAiAt = [datetime]::MinValue; Start-DeepSeekBalance }
+    Import-AiAdapters
 
     if (Restore-CachedWeather) {
         Update-WeatherUI
@@ -3613,6 +3503,11 @@ public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int 
             [math]::Round($script:Window.ActualWidth), [math]::Round($script:Window.ActualHeight))
     } catch {
         Write-Log "窗口重绘失败：$($_.Exception.Message)"
+    }
+
+if ($firstRun -and $script:UI['FirstRunHint']) {
+        $script:UI['FirstRunHint'].Visibility = [System.Windows.Visibility]::Visible
+        Open-Settings
     }
 
     $script:Ready = $true

@@ -1,10 +1,10 @@
 {
     "city":  "",
-    "latitude":  0,
-    "longitude":  0,
+    "latitude":  null,
+    "longitude":  null,
     "locatedBy":  "",
-    "locatedAt":  "",
-    "weatherProvider":  "wttr.in",
+    "locatedAt":  null,
+    "weatherProvider":  "",
     "opacity":  0.96,
     "alwaysOnTop":  true,
     "left":  null,
@@ -22,5 +22,6 @@
     "priceHit":  0.04,
     "priceMiss":  2,
     "priceOut":  8,
-    "background":  "#1B2130"
+    "background":  "#1B2130",
+    "cornerRadius":  14
 }
