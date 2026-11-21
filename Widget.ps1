@@ -3429,6 +3429,28 @@ function Invoke-Preview {
         $script:UI['ReminderBanner'].Visibility = [System.Windows.Visibility]::Visible
         $script:UI['ReminderText'].Text = '18:00 交季度报告'
     }
+    if ($env:WIDGET_PREVIEW_AI) {
+        Get-AiState
+        $script:Ai.Claude.Ok = $true
+        $script:Ai.Claude.Today = 12345
+        $script:Ai.Codex.Ok = $true
+        $script:Ai.Codex.Today = 8200
+        $script:Ai.Dsh.Ok = $true
+        $script:Ai.Dsh.Cost = 16.2
+        $script:Ai.Dsh.Peak = 16.2
+        $script:Ai.Dsh.OffPeak = 0
+        $script:Ai.Dsh.Requests = 650
+        $script:Ai.Dsh.Models = @([pscustomobject]@{ model = 'deepseek-flash' })
+        $script:Ai.DeepSeek.Ok = $true
+        $script:Ai.DeepSeek.Balance = 9.47
+        $script:Ai.DeepSeek.Currency = 'CNY'
+        $script:UI['MainPanel'].Visibility = [System.Windows.Visibility]::Collapsed
+        $script:UI['AiPanel'].Visibility = [System.Windows.Visibility]::Visible
+        foreach ($n in 'MinimizeButton', 'PinButton', 'SettingsButton') { $script:UI[$n].Visibility = [System.Windows.Visibility]::Collapsed }
+        Render-AiList
+        if ($script:UI['AiKeyLabel']) { $script:UI['AiKeyLabel'].Text = 'DeepSeek API key（只存本机，用来查账户余额）' }
+        if ($script:UI['AiKeyBox']) { $script:UI['AiKeyBox'].Text = '' }
+    }
     if ($env:WIDGET_PREVIEW_COMPACT) {
         $script:UI['MainPanel'].Visibility = [System.Windows.Visibility]::Collapsed
         $script:UI['CompactPanel'].Visibility = [System.Windows.Visibility]::Visible
