@@ -1,0 +1,13 @@
+# 本机配置与私人数据（含 DeepSeek API key），不要上传
+config.json
+tasks.json
+cache/
+logs/
+
+# 桌面截图，含个人壁纸/任务栏，不上传
+preview*.png
+
+# 临时文件
+*.tmp
+*.log
+*.bak
